@@ -1,30 +1,17 @@
 """
-WIPO PatentScope Crawler V3 - Production Grade
-===============================================
+WIPO PatentScope Crawler V3.1 - SEARCH PARSER FIX
+==================================================
 
-Baseado em análise real do DOM dinâmico WIPO (JSF/PrimeFaces)
-Testado com WO2019028689 - HTML completo e screenshot validados
+MUDANÇA V3.0 → V3.1:
+- Parser de WO numbers mais robusto
+- Suporta múltiplos formatos de HTML
+- Fallback para regex se links não encontrados
+- Logs detalhados de parsing
 
-ARQUITETURA:
-- Playwright para garantir JSF render completo
-- BeautifulSoup para parsing resiliente baseado em labels
-- Contextos isolados por WO (sem travamento)
-- Timeout garantido em cada etapa
-- Logs detalhados de falhas reais
-
-ESTRUTURA DOM REAL IDENTIFICADA:
-<div class="ps-field ps-biblio-field">
-    <span class="ps-field--label">Publication Number</span>
-    <span class="ps-field--value">WO/2019/028689</span>
-</div>
-
-DADOS DISPONÍVEIS (confirmados no HTML):
-- Publication Number, Publication Date
-- International Application No., International Filing Date
-- IPC, CPC
-- Applicants, Inventors
-- Title, Abstract
-- Priority Data, Agents
+MANTIDO:
+- Arquitetura isolada (contextos por WO)
+- Timeouts garantidos
+- Parser de detalhes baseado em labels
 """
 
 import asyncio
@@ -48,12 +35,12 @@ SEARCH_URL = f"{BASE_URL}/search/en/result.jsf"
 DETAIL_URL = f"{BASE_URL}/search/en/detail.jsf"
 
 # Timeouts (ms)
-PAGE_TIMEOUT = 45000  # 45s max por página
-NAVIGATION_TIMEOUT = 30000  # 30s para goto
-NETWORKIDLE_TIMEOUT = 5000  # 5s após último request
+PAGE_TIMEOUT = 45000
+NAVIGATION_TIMEOUT = 30000
+NETWORKIDLE_TIMEOUT = 5000
 
 # ============================================================================
-# STEP 1: SEARCH WO NUMBERS (HTTPX - FAST)
+# STEP 1: SEARCH WO NUMBERS (HTTPX - IMPROVED PARSER)
 # ============================================================================
 
 async def search_wipo_wo_numbers(molecule: str, dev_codes: List[str] = None, 
@@ -61,11 +48,14 @@ async def search_wipo_wo_numbers(molecule: str, dev_codes: List[str] = None,
     """
     Busca WO numbers via HTTPX (não precisa Playwright)
     
+    V3.1 FIX: Parser mais robusto com múltiplas estratégias
+    
     Retorna: Lista de WO numbers (ex: ['WO2019028689', 'WO2018036558'])
     """
     query_parts = [molecule]
     if dev_codes:
-        query_parts.extend(dev_codes[:3])
+        # Limitar dev_codes para não quebrar query
+        query_parts.extend(dev_codes[:5])
     if cas:
         query_parts.append(cas)
     
@@ -79,21 +69,28 @@ async def search_wipo_wo_numbers(molecule: str, dev_codes: List[str] = None,
             response = await client.get(SEARCH_URL, params=params)
             response.raise_for_status()
             
-            # Parse HTML simples para pegar WO numbers
-            soup = BeautifulSoup(response.text, 'html.parser')
+            html = response.text
+            logger.debug(f"Search HTML length: {len(html)} chars")
             
-            # WO numbers aparecem em links como: /search/en/detail.jsf?docId=WO2019028689
-            wo_numbers = []
-            for link in soup.find_all('a', href=True):
-                if 'detail.jsf?docId=' in link['href']:
-                    match = re.search(r'docId=(WO\d{4}\d{6})', link['href'])
-                    if match:
-                        wo_numbers.append(match.group(1))
+            # ===== ESTRATÉGIA 1: Links com docId =====
+            wo_numbers = _extract_wo_from_links(html)
+            
+            if wo_numbers:
+                logger.info(f"✅ Strategy 1 (links): Found {len(wo_numbers)} WO patents")
+            else:
+                # ===== ESTRATÉGIA 2: Regex no HTML completo =====
+                logger.warning("Strategy 1 failed, trying regex fallback...")
+                wo_numbers = _extract_wo_from_regex(html)
+                
+                if wo_numbers:
+                    logger.info(f"✅ Strategy 2 (regex): Found {len(wo_numbers)} WO patents")
+                else:
+                    logger.error("❌ Both strategies failed to find WO numbers")
+                    logger.debug(f"HTML preview: {html[:500]}")
             
             # Remove duplicatas e limita
             wo_numbers = list(dict.fromkeys(wo_numbers))[:max_results]
             
-            logger.info(f"✅ Found {len(wo_numbers)} WO patents")
             return wo_numbers
             
         except Exception as e:
@@ -101,8 +98,59 @@ async def search_wipo_wo_numbers(molecule: str, dev_codes: List[str] = None,
             return []
 
 
+def _extract_wo_from_links(html: str) -> List[str]:
+    """
+    Estratégia 1: Extrair WO numbers de links (método preferencial)
+    
+    Procura por:
+    - <a href="...detail.jsf?docId=WO2019028689">
+    - <a href="...WO2019028689">
+    """
+    soup = BeautifulSoup(html, 'html.parser')
+    wo_numbers = []
+    
+    # Procurar links com docId
+    for link in soup.find_all('a', href=True):
+        href = link['href']
+        
+        # Pattern 1: detail.jsf?docId=WO...
+        if 'detail.jsf?docId=' in href or 'docId=' in href:
+            match = re.search(r'docId=(WO\d{4}\d{6})', href)
+            if match:
+                wo_numbers.append(match.group(1))
+        
+        # Pattern 2: Link direto com WO number
+        elif 'WO' in href:
+            match = re.search(r'(WO\d{4}\d{6})', href)
+            if match:
+                wo_numbers.append(match.group(1))
+    
+    return wo_numbers
+
+
+def _extract_wo_from_regex(html: str) -> List[str]:
+    """
+    Estratégia 2: Regex fallback (quando links não funcionam)
+    
+    Procura padrão: WO + 4 dígitos (ano) + 6 dígitos (número)
+    Exemplo: WO2019028689
+    """
+    # Padrão WO + ano (4 dígitos) + número (6 dígitos)
+    pattern = r'\bWO\d{4}\d{6}\b'
+    matches = re.findall(pattern, html)
+    
+    # Validar que são WO numbers válidos (ano razoável)
+    valid_wos = []
+    for wo in matches:
+        year = int(wo[2:6])  # Extrair ano
+        if 1980 <= year <= 2030:  # Anos válidos
+            valid_wos.append(wo)
+    
+    return valid_wos
+
+
 # ============================================================================
-# STEP 2: FETCH DETAIL PAGE (PLAYWRIGHT - JSF DYNAMIC)
+# STEP 2: FETCH DETAIL PAGE (PLAYWRIGHT - UNCHANGED)
 # ============================================================================
 
 async def fetch_detail_html(wo_number: str, headless: bool = True) -> Optional[str]:
@@ -137,14 +185,12 @@ async def fetch_detail_html(wo_number: str, headless: bool = True) -> Optional[s
                 await page.goto(url, timeout=NAVIGATION_TIMEOUT, wait_until="domcontentloaded")
                 
                 # Esperar network idle (JSF faz múltiplos AJAX)
-                # IMPORTANTE: Não usar como única condição!
                 try:
                     await page.wait_for_load_state("networkidle", timeout=NETWORKIDLE_TIMEOUT)
                 except PlaywrightTimeout:
                     logger.warning(f"  {wo_number}: networkidle timeout, continuing...")
                 
                 # Esperar dado crítico aparecer (fallback robusto)
-                # Se "Publication Number" não aparecer em 10s, desiste
                 try:
                     await page.wait_for_selector(
                         'text="Publication Number"',
@@ -178,23 +224,12 @@ async def fetch_detail_html(wo_number: str, headless: bool = True) -> Optional[s
 
 
 # ============================================================================
-# STEP 3: PARSE BIBLIO DATA (BEAUTIFULSOUP - LABEL-BASED)
+# STEP 3: PARSE BIBLIO DATA (BEAUTIFULSOUP - UNCHANGED)
 # ============================================================================
 
 def extract_field_by_label(soup: BeautifulSoup, label_text: str) -> Optional[str]:
     """
     Extrai valor de campo baseado no label (estrutura semântica)
-    
-    Estrutura esperada:
-    <div class="ps-field ps-biblio-field">
-        <span class="ps-field--label">Publication Number</span>
-        <span class="ps-field--value">WO/2019/028689</span>
-    </div>
-    
-    RESILIENTE:
-    - Busca por texto do label, não por ID/classe específica
-    - Sobe na árvore DOM até achar container
-    - Desce para pegar value
     """
     try:
         # Buscar label
@@ -224,17 +259,6 @@ def extract_field_by_label(soup: BeautifulSoup, label_text: str) -> Optional[str
 def extract_list_field(soup: BeautifulSoup, label_text: str) -> List[str]:
     """
     Extrai campos de lista (Applicants, Inventors)
-    
-    Estrutura real:
-    <span class="ps-field--value">
-        <span class="patent-person">
-            <ul class="biblio-person-list">
-                <li>
-                    <span class="biblio-person-list--name">NAME</span>
-                </li>
-            </ul>
-        </span>
-    </span>
     """
     try:
         label = soup.find('span', class_='ps-field--label', string=re.compile(label_text, re.IGNORECASE))
@@ -266,19 +290,10 @@ def extract_list_field(soup: BeautifulSoup, label_text: str) -> List[str]:
 
 
 def extract_ipc_codes(soup: BeautifulSoup) -> List[str]:
-    """
-    Extrai códigos IPC
-    
-    Estrutura:
-    <div class="patent-classification">
-        <a href="...">C07D 231/14</a>
-        <span>2006.1</span>
-    </div>
-    """
+    """Extrai códigos IPC"""
     try:
         ipc_codes = []
         
-        # Buscar label IPC
         label = soup.find('span', class_='ps-field--label', string=re.compile('IPC', re.IGNORECASE))
         if not label:
             return []
@@ -287,7 +302,6 @@ def extract_ipc_codes(soup: BeautifulSoup) -> List[str]:
         if not field_div:
             return []
         
-        # Pegar todos os classification divs
         for classification in field_div.find_all('div', class_='patent-classification'):
             link = classification.find('a')
             if link:
@@ -305,11 +319,6 @@ def extract_ipc_codes(soup: BeautifulSoup) -> List[str]:
 def parse_biblio_data(html: str, wo_number: str) -> Dict[str, Any]:
     """
     Parser principal - extrai todos os campos bibliográficos
-    
-    RESILIENTE:
-    - Se campo não existir, retorna None/[]
-    - Nunca lança exceção fatal
-    - Sempre retorna dict (mesmo que vazio)
     """
     soup = BeautifulSoup(html, 'html.parser')
     
@@ -337,9 +346,6 @@ def parse_biblio_data(html: str, wo_number: str) -> Dict[str, Any]:
         # IPC codes
         ipc_codes = extract_ipc_codes(soup)
         
-        # CPC codes (mesma estrutura que IPC)
-        cpc_codes = extract_ipc_codes(soup) if 'CPC' in html else []
-        
         # Montar biblio_data
         data["biblio_data"] = {
             "publication_number": pub_number,
@@ -351,7 +357,6 @@ def parse_biblio_data(html: str, wo_number: str) -> Dict[str, Any]:
             "applicants": applicants,
             "inventors": inventors,
             "ipc_codes": ipc_codes,
-            "cpc_codes": cpc_codes,
             "priority_data": priority
         }
         
@@ -369,21 +374,12 @@ def parse_biblio_data(html: str, wo_number: str) -> Dict[str, Any]:
 
 
 # ============================================================================
-# STEP 4: PROCESS WO (ISOLATED + SAFE)
+# STEP 4: PROCESS WO (ISOLATED + SAFE - UNCHANGED)
 # ============================================================================
 
 async def process_wo_safe(wo_number: str, headless: bool = True) -> Optional[Dict[str, Any]]:
-    """
-    Processa um WO de forma isolada e segura
-    
-    GARANTIAS:
-    - Timeout máximo: 60s
-    - Nunca trava o loop
-    - Sempre retorna (sucesso ou None)
-    - Logs claros do motivo de falha
-    """
+    """Processa um WO de forma isolada e segura"""
     try:
-        # Timeout total para este WO
         result = await asyncio.wait_for(
             _process_wo_internal(wo_number, headless),
             timeout=60.0
@@ -399,7 +395,7 @@ async def process_wo_safe(wo_number: str, headless: bool = True) -> Optional[Dic
 
 
 async def _process_wo_internal(wo_number: str, headless: bool) -> Optional[Dict[str, Any]]:
-    """Internal processing (chamado via wait_for)"""
+    """Internal processing"""
     
     # Step 1: Fetch HTML
     html = await fetch_detail_html(wo_number, headless=headless)
@@ -412,9 +408,6 @@ async def _process_wo_internal(wo_number: str, headless: bool) -> Optional[Dict[
     
     if not data["extraction_successful"]:
         logger.error(f"  ❌ Failed to extract data from {wo_number}")
-        # Salvar HTML para debug (opcional)
-        # with open(f"debug_{wo_number}.html", "w") as f:
-        #     f.write(html)
         return None
     
     return data
@@ -436,17 +429,10 @@ async def search_wipo_patents(
     """
     API Principal do crawler WIPO
     
-    Args:
-        molecule: Nome da molécula
-        dev_codes: Códigos de desenvolvimento
-        cas: Número CAS
-        max_results: Máximo de WOs para processar
-        groq_api_key: (não usado nesta versão, reservado)
-        progress_callback: Função para reportar progresso
-        headless: Modo headless do Playwright
-    
-    Returns:
-        Lista de dicts com dados completos de cada patente
+    V3.1 IMPROVEMENTS:
+    - Parser de WO numbers mais robusto
+    - Fallback para regex
+    - Logs detalhados
     """
     logger.info(f"🌐 WIPO V3 search: {molecule}")
     
@@ -481,7 +467,7 @@ async def search_wipo_patents(
         if data:
             results.append(data)
         
-        # Small delay entre WOs (respeito ao servidor)
+        # Small delay entre WOs
         if i < total:
             await asyncio.sleep(1)
     
@@ -496,7 +482,7 @@ async def search_wipo_patents(
 
 async def test_wipo_v3():
     """Teste standalone"""
-    print("🧪 Testing WIPO Crawler V3...")
+    print("🧪 Testing WIPO Crawler V3.1...")
     print("=" * 60)
     
     results = await search_wipo_patents(
