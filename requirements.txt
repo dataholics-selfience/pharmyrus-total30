@@ -1,0 +1,10 @@
+fastapi==0.109.0
+uvicorn[standard]==0.27.0
+httpx==0.26.0
+pydantic==2.5.3
+python-multipart==0.0.6
+playwright==1.48.0
+playwright-stealth==1.0.6
+beautifulsoup4==4.12.2
+celery==5.3.4
+redis==5.0.1
